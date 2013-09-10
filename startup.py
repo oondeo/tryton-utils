@@ -1,10 +1,12 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 
 import sys
 import os
 import datetime
 from dateutil.relativedelta import relativedelta
-from decimal import Decimal
+from optparse import OptionParser
+
+from common import Settings
 
 directory = os.path.abspath(os.path.normpath(os.path.join(os.getcwd(),
                     'trytond')))
@@ -13,127 +15,251 @@ if os.path.isdir(directory):
     sys.path.insert(0, directory)
 
 from proteus import (
-    config as _config,
+    config as pconfig,
     Model,
     Wizard)
 
-config = None
-today = datetime.date.today()
-now = datetime.datetime.now()
+TODAY = datetime.date.today()
+NOW = datetime.datetime.now()
 
 
-class Settings(dict):
-    def __init__(self, *args, **kw):
-        super(Settings, self).__init__(*args, **kw)
-        self.__dict__ = self
+def parse_arguments(arguments):
+    usage = 'usage: %prog [options] <database>'
+    parser = OptionParser(usage=usage)
+    parser.add_option('-m', '--module', dest='module')
+
+    (option, arguments) = parser.parse_args(arguments)
+
+    settings = Settings()
+
+    # Remove first argument because it's application name
+    arguments.pop(0)
+
+    if not arguments:
+        parser.error('Database not given')
+    settings.database = arguments.pop(0)
+
+    settings.module = option.module
+
+    return settings
 
 
-def connect_database(database):
-    config = _config.set_trytond(database, database_type='postgresql',
-        password='admin')
-    return config
+def connect_database(database, password='admin', database_type='postgresql'):
+    return pconfig.set_trytond(database, database_type=database_type,
+        password=password)
 
 
-def install_module(module):
-    '''Install client module with dependencies.'''
+def install_modules(config, modules):
+    '''
+    Function get from tryton_demo.py in tryton-tools repo:
+    http://hg.tryton.org/tryton-tools
+    '''
     Module = Model.get('ir.module.module')
-    (module,) = Module.find([('name', '=', module)])
-    Module.install([module.id], config.context)
+    modules = Module.find([
+        ('name', 'in', modules),
+        #('state', '!=', 'installed'),
+    ])
+    Module.install([x.id for x in modules], config.context)
+    modules = [x.name for x in Module.find([
+                ('state', 'in', ('to install', 'to_upgrade')),
+                ])]
     Wizard('ir.module.module.install_upgrade').execute('upgrade')
 
+    ConfigWizardItem = Model.get('ir.module.module.config_wizard.item')
+    for item in ConfigWizardItem.find([('state', '!=', 'done')]):
+        item.state = 'done'
+        item.save()
 
-def create_company():
-    Currency = Model.get('currency.currency')
-    CurrencyRate = Model.get('currency.currency.rate')
-    Company = Model.get('company.company')
+    installed_modules = [m.name
+        for m in Module.find([('state', '=', 'installed')])]
+    return modules, installed_modules
+
+
+def create_party(config, name, street=None, zip=None, city=None,
+        subdivision_code=None, country_code='ES', phone=None, website=None):
+    Address = Model.get('party.address')
+    ContactMechanism = Model.get('party.contact_mechanism')
+    Country = Model.get('country.country')
     Party = Model.get('party.party')
+    Subdivision = Model.get('country.subdivision')
+
+    parties = Party.find([('name', '=', name)])
+    if parties:
+        return parties[0]
+
+    country, = Country.find([('code', '=', country_code)])
+    if subdivision_code:
+        subdivision, = Subdivision.find([('code', '=', subdivision_code)])
+    else:
+        subdivision = None
+
+    party = Party(name=name)
+    party.addresses.pop()
+    party.addresses.append(
+        Address(street=street,
+            zip=zip,
+            city=city,
+            country=country,
+            subdivision=subdivision))
+    if phone:
+        party.contact_mechanisms.append(
+            ContactMechanism(type='phone',
+                value=phone))
+    if website:
+        party.contact_mechanisms.append(
+            ContactMechanism(type='website',
+                value=website))
+
+    party.save()
+    return party
+
+
+def create_company(config, name, street=None, zip=None, city=None,
+        subdivision_code=None, country_code='ES', currency_code='EUR',
+        phone=None, website=None):
+    '''
+    Based on tryton_demo.py in tryton-tools repo:
+    http://hg.tryton.org/tryton-tools
+    '''
+    Company = Model.get('company.company')
+    Currency = Model.get('currency.currency')
+
+    party = create_party(config, name, street=street, zip=zip, city=city,
+        subdivision_code=subdivision_code, country_code=country_code,
+        phone=phone, website=website)
+
+    companies = Company.find([('party', '=', party.id)])
+    if companies:
+        return companies[0]
+
+    currency, = Currency.find([('code', '=', currency_code)])
 
     company_config = Wizard('company.company.config')
     company_config.execute('company')
     company = company_config.form
-    party = Party(name='<your company>')
-    party.save()
     company.party = party
-
-    currencies = Currency.find([('code', '=', 'EUR')])
-    if not currencies:
-        currency = Currency(name='EUR0', symbol=u'$', code='EUR',
-            rounding=Decimal('0.01'), mon_grouping='[3,3,0]',
-            mon_decimal_point='.')
-        currency.save()
-        CurrencyRate(date=today + relativedelta(month=1, day=1),
-            rate=Decimal('1.0'), currency=currency).save()
-    else:
-        currency, = currencies
-
     company.currency = currency
     company_config.execute('add')
-    company, = Company.find([])
 
+    # Reload context
     User = Model.get('res.user')
     config._context = User.get_preferences(True, config.context)
 
+    company, = Company.find([('party', '=', party.id)])
     return company
 
 
-def create_fiscal_year(company, year=None):
-    FiscalYear = Model.get('account.fiscalyear')
-    Sequence = Model.get('ir.sequence')
-
-    if year is None:
-        year = today.year
-
-    post_move_sequence = Sequence(name='%s' % year,
-         code='account.move', company=company)
-    post_move_sequence.save()
-
-    fiscalyear = FiscalYear(name='%s' % year)
-    fiscalyear.start_date = today + relativedelta(month=1, day=1)
-    fiscalyear.end_date = today + relativedelta(month=12, day=31)
-    fiscalyear.company = company
-    fiscalyear.post_move_sequence = post_move_sequence
-    fiscalyear.save()
-
-    FiscalYear.create_period([fiscalyear.id], config.context)
-    return fiscalyear
-
-
-def create_chart_of_accounts(company):
+def create_chart_of_accounts(config, template_name, company):
     AccountTemplate = Model.get('account.account.template')
     Account = Model.get('account.account')
 
-    account_template, = AccountTemplate.find([('parent', '=', False)])
+    root_accounts = Account.find([('parent', '=', None)])
+    if root_accounts:
+        return
+
+    account_templates = AccountTemplate.find([
+            ('name', '=', template_name),
+            ('parent', '=', None),
+            ])
+    assert len(account_templates) == 1, ('Unexpected num of root templates '
+        'with name "%s": %s' % (template_name, account_templates))
+
     create_chart = Wizard('account.create_chart')
     create_chart.execute('account')
-    create_chart.form.account_template = account_template
+    create_chart.form.account_template = account_templates[0]
     create_chart.form.company = company
     create_chart.execute('create_account')
 
-    receivable, = Account.find([
+    receivable = Account.find([
             ('kind', '=', 'receivable'),
             ('company', '=', company.id),
             ])
-    payable, = Account.find([
+    print "receivable: ", receivable
+    receivable = receivable[0]
+    payable = Account.find([
             ('kind', '=', 'payable'),
             ('company', '=', company.id),
-            ])
-    revenue, = Account.find([
-            ('kind', '=', 'revenue'),
-            ('company', '=', company.id),
-            ])
-    expense, = Account.find([
-            ('kind', '=', 'expense'),
-            ('company', '=', company.id),
-            ])
-    cash, = Account.find([
-            ('kind', '=', 'other'),
-            ('company', '=', company.id),
-            ('name', '=', 'Main Cash'),
-            ])
+            ])[0]
+    #revenue, = Account.find([
+    #        ('kind', '=', 'revenue'),
+    #        ('company', '=', company.id),
+    #        ])
+    #expense, = Account.find([
+    #        ('kind', '=', 'expense'),
+    #        ('company', '=', company.id),
+    #        ])
+    #cash, = Account.find([
+    #        ('kind', '=', 'other'),
+    #        ('company', '=', company.id),
+    #        ('name', '=', 'Main Cash'),
+    #        ])
     create_chart.form.account_receivable = receivable
     create_chart.form.account_payable = payable
     create_chart.execute('create_properties')
     # TODO: return create_chart
+
+
+def create_fiscal_year(config, company, year=None):
+    FiscalYear = Model.get('account.fiscalyear')
+    Module = Model.get('ir.module.module')
+    Sequence = Model.get('ir.sequence')
+    SequenceStrict = Model.get('ir.sequence.strict')
+
+    if year is None:
+        year = TODAY.year
+
+    installed_modules = [m.name
+        for m in Module.find([('state', '=', 'installed')])]
+
+    post_move_sequence = Sequence.find([
+            ('name', '=', '%s' % year),
+            ('code', '=', 'account_move'),
+            ('company', '=', company.id),
+            ])
+    if post_move_sequence:
+        post_move_sequence = post_move_sequence[0]
+    else:
+        post_move_sequence = Sequence(name='%s' % year,
+            code='account.move', company=company)
+        post_move_sequence.save()
+
+    fiscalyear = FiscalYear.find([
+            ('name', '=', '%s' % year),
+            ('company', '=', company.id),
+            ])
+    if fiscalyear:
+        fiscalyear = fiscalyear[0]
+    else:
+        fiscalyear = FiscalYear(name='%s' % year)
+        fiscalyear.start_date = TODAY + relativedelta(month=1, day=1)
+        fiscalyear.end_date = TODAY + relativedelta(month=12, day=31)
+        fiscalyear.company = company
+        fiscalyear.post_move_sequence = post_move_sequence
+        if 'account_invoice' in installed_modules:
+            for attr, name in (('out_invoice_sequence', 'Invoice'),
+                    ('in_invoice_sequence', 'Supplier Invoice'),
+                    ('out_credit_note_sequence', 'Credit Note'),
+                    ('in_credit_note_sequence', 'Supplier Credit Note')):
+                sequence = SequenceStrict.find([
+                        ('name', '=', '%s %s' % (name, year)),
+                        ('code', '=', 'account.invoice'),
+                        ('company', '=', company.id),
+                        ])
+                if sequence:
+                    sequence = sequence[0]
+                else:
+                    sequence = SequenceStrict(
+                        name='%s %s' % (name, year),
+                        code='account.invoice',
+                        company=company)
+                    sequence.save()
+                setattr(fiscalyear, attr, sequence)
+        fiscalyear.save()
+
+    if not fiscalyear.periods:
+        FiscalYear.create_period([fiscalyear.id], config.context)
+
+    return fiscalyear
 
 
 def create_analytic_account(name, type, parent):
@@ -141,6 +267,7 @@ def create_analytic_account(name, type, parent):
     account = Account(name=name,
         type=type,
         state='opened',
+        root=parent and parent.root or parent,
         parent=parent,
         display_balance='credit-debit')
     return account
@@ -148,15 +275,23 @@ def create_analytic_account(name, type, parent):
 
 def create_location(name, type, parent=None, code=None, address=None):
     Location = Model.get('stock.location')
-    return Location(type=type,
-        name=name,
-        code=code,
-        parent=parent,
-        address=address)
+
+    location = Location.find([
+            ('name', '=', name),
+            ('parent', '=', parent and parent.id or None),
+            ])
+    if location:
+        return location[0]
+    else:
+        return Location(type=type,
+            name=name,
+            code=code,
+            parent=parent,
+            address=address)
 
 
-def create_warehouse(name, code=None, address=None, separate_input=False,
-        separate_output=False):
+def create_warehouse(name, code=None, address=None,
+        separate_input=False, separate_output=False):
     warehouse = create_location(name, 'warehouse', code=code, address=address)
 
     storage_location = create_location('%s Storage' % name, 'storage')
@@ -179,13 +314,17 @@ def create_warehouse(name, code=None, address=None, separate_input=False,
         output_location.save()
         warehouse.output_location = output_location
     else:
-        warehouse.ouput_location = storage_location
+        warehouse.output_location = storage_location
 
     return warehouse
 
 
 if __name__ == "__main__":
-    install_module(module)
-    create_company()
-    create_fiscal_year()
-    create_chart_of_accounts()
+    settings = parse_arguments(sys.argv)
+
+    config = connect_database(settings.database)
+    install_modules(config, [settings.module])
+
+    create_company(config, '<your name>')
+    create_fiscal_year(config)
+    create_chart_of_accounts(config)
